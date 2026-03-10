@@ -21,19 +21,11 @@ from tkinter import filedialog, messagebox
 # ── Constants ────────────────────────────────────────────────────────────────
 
 RETRY_ATTEMPTS = 3
-RETRY_DELAY_BASE = 3
-INTER_FILE_DELAY = 2.5          # pause between processing each file
-DOC_OPEN_SETTLE = 3.0           # after Word opens a document
-DOC_READY_POLL_INTERVAL = 0.5   # interval when waiting for doc ready
-DOC_READY_MAX_WAIT = 10.0       # max seconds to wait for document to be ready
-DOC_SAVE_SETTLE = 2.0          # after Word saves as PDF
-FILE_STABLE_CHECK_INTERVAL = 0.25
-FILE_STABLE_MIN_CHECKS = 2      # file size unchanged for this many checks
-DOC_CLOSE_SETTLE = 1.5          # after closing a document
-APP_QUIT_SETTLE = 2.0           # after quitting Word/Outlook before next use
-OUTLOOK_MSG_LOAD_SETTLE = 2.5   # after opening .msg before reading properties
-OUTLOOK_AFTER_MSG_SETTLE = 1.0  # after finishing with one .msg before next
-HTML_TO_DISK_SETTLE = 1.0      # after writing HTML file before opening in Word
+RETRY_DELAY_BASE = 2
+DOC_READY_POLL = 0.3            # interval when polling for doc ready
+DOC_READY_TIMEOUT = 8.0         # max seconds to wait for doc to be ready
+FILE_STABLE_POLL = 0.2          # interval when checking output file
+FILE_STABLE_CHECKS = 2          # unchanged size checks before "stable"
 
 SUPPORTED_EXT = {'.pdf', '.doc', '.docx', '.msg'}
 
@@ -92,98 +84,36 @@ def _base_dir():
 
 # ── Processing helpers ───────────────────────────────────────────────────────
 
-def _wait_for_file_stable(filepath, timeout=8.0, check_interval=FILE_STABLE_CHECK_INTERVAL):
-    """Wait until file exists and size is unchanged for FILE_STABLE_MIN_CHECKS checks."""
+def _wait_file_stable(filepath, timeout=6.0):
+    """Block until *filepath* exists and its size stops changing."""
     deadline = time.monotonic() + timeout
     last_size = -1
-    stable_count = 0
+    ok = 0
     while time.monotonic() < deadline:
         try:
             if os.path.isfile(filepath):
-                size = os.path.getsize(filepath)
-                if size == last_size and size >= 0:
-                    stable_count += 1
-                    if stable_count >= FILE_STABLE_MIN_CHECKS:
+                sz = os.path.getsize(filepath)
+                if sz == last_size and sz > 0:
+                    ok += 1
+                    if ok >= FILE_STABLE_CHECKS:
                         return
                 else:
-                    stable_count = 0
-                    last_size = size
-            else:
-                stable_count = 0
+                    ok = 0
+                    last_size = sz
         except Exception:
-            stable_count = 0
-        time.sleep(check_interval)
+            ok = 0
+        time.sleep(FILE_STABLE_POLL)
 
 
-def _wait_for_doc_ready(doc, log_fn):
-    """Give Word time to fully build the document after Open (e.g. finish layout)."""
-    time.sleep(DOC_OPEN_SETTLE)
-    deadline = time.monotonic() + DOC_READY_MAX_WAIT
+def _wait_doc_ready(doc):
+    """Poll until Word finishes loading/laying out the document."""
+    deadline = time.monotonic() + DOC_READY_TIMEOUT
     while time.monotonic() < deadline:
         try:
-            # Touch content to force Word to finish loading; can trigger background layout
             _ = doc.Content.Start
-            time.sleep(0.5)
             return
         except Exception:
-            time.sleep(DOC_READY_POLL_INTERVAL)
-    log_fn("    Note: document ready wait reached timeout; continuing anyway.")
-
-
-def _create_word_app():
-    import comtypes.client
-    word = comtypes.client.CreateObject('Word.Application')
-    word.Visible = False
-    return word
-
-
-def _open_doc_with_retry(word, path, log_fn):
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            doc = word.Documents.Open(path)
-            if doc is None:
-                raise RuntimeError("Word returned None after Documents.Open")
-            _wait_for_doc_ready(doc, log_fn)
-            return doc
-        except Exception:
-            delay = RETRY_DELAY_BASE * (attempt + 1)
-            if attempt < RETRY_ATTEMPTS - 1:
-                log_fn(f"    Retry {attempt + 1}/{RETRY_ATTEMPTS}: "
-                       f"Word failed to open, waiting {delay}s ...")
-                time.sleep(delay)
-            else:
-                raise
-
-
-def _save_pdf_with_retry(doc, pdf_path, log_fn):
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            doc.SaveAs(pdf_path, FileFormat=17)
-            time.sleep(DOC_SAVE_SETTLE)
-            _wait_for_file_stable(pdf_path)
-            if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0:
-                return
-            raise RuntimeError("PDF missing or empty after SaveAs")
-        except Exception:
-            delay = RETRY_DELAY_BASE * (attempt + 1)
-            if attempt < RETRY_ATTEMPTS - 1:
-                log_fn(f"    Retry {attempt + 1}/{RETRY_ATTEMPTS}: "
-                       f"PDF save failed, waiting {delay}s ...")
-                time.sleep(delay)
-            else:
-                raise
-
-
-def _word_to_pdf(src_path, out_pdf_path, log_fn):
-    word = _create_word_app()
-    try:
-        doc = _open_doc_with_retry(word, src_path, log_fn)
-        _save_pdf_with_retry(doc, out_pdf_path, log_fn)
-        doc.Close(False)
-        time.sleep(DOC_CLOSE_SETTLE)
-    finally:
-        word.Quit()
-        time.sleep(APP_QUIT_SETTLE)
+            time.sleep(DOC_READY_POLL)
 
 
 def _extract_html_body(html_source):
@@ -203,12 +133,90 @@ def _format_email_datetime(dt):
         return str(dt)
 
 
-def _msg_to_pdf(src_path, out_pdf_path, log_fn):
+# ── Reusable COM wrapper (one Word instance for the entire run) ──────────────
+
+class _WordApp:
+    """Manages a single Word COM instance, reused across all conversions."""
+
+    def __init__(self):
+        self._app = None
+
+    def _ensure(self):
+        if self._app is not None:
+            try:
+                _ = self._app.Visible
+                return
+            except Exception:
+                self._app = None
+        import comtypes.client
+        self._app = comtypes.client.CreateObject('Word.Application')
+        self._app.Visible = False
+
+    def open_and_save_pdf(self, src_path, pdf_path, log_fn):
+        """Open *src_path* in Word, save as PDF, close the document."""
+        self._ensure()
+        doc = self._open(src_path, log_fn)
+        try:
+            self._save_pdf(doc, pdf_path, log_fn)
+        finally:
+            try:
+                doc.Close(False)
+            except Exception:
+                pass
+
+    def quit(self):
+        if self._app is not None:
+            try:
+                self._app.Quit()
+            except Exception:
+                pass
+            self._app = None
+
+    def _open(self, path, log_fn):
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                self._ensure()
+                doc = self._app.Documents.Open(path)
+                if doc is None:
+                    raise RuntimeError("Word returned None")
+                _wait_doc_ready(doc)
+                return doc
+            except Exception:
+                self._app = None
+                delay = RETRY_DELAY_BASE * (attempt + 1)
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log_fn(f"    Retry {attempt + 1}/{RETRY_ATTEMPTS}: "
+                           f"Word open failed, waiting {delay}s ...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+    def _save_pdf(self, doc, pdf_path, log_fn):
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                doc.SaveAs(pdf_path, FileFormat=17)
+                _wait_file_stable(pdf_path)
+                if os.path.isfile(pdf_path) and os.path.getsize(pdf_path) > 0:
+                    return
+                raise RuntimeError("PDF missing or empty after SaveAs")
+            except Exception:
+                delay = RETRY_DELAY_BASE * (attempt + 1)
+                if attempt < RETRY_ATTEMPTS - 1:
+                    log_fn(f"    Retry {attempt + 1}/{RETRY_ATTEMPTS}: "
+                           f"PDF save failed, waiting {delay}s ...")
+                    time.sleep(delay)
+                else:
+                    raise
+
+
+def _msg_to_html(src_path, out_html_path):
+    """Extract .msg metadata via Outlook COM and write a clean HTML file."""
     import win32com.client
 
     outlook = win32com.client.Dispatch('Outlook.Application')
-    msg = outlook.CreateItemFromTemplate(src_path)
-    time.sleep(OUTLOOK_MSG_LOAD_SETTLE)
+    # OpenSharedItem preserves the original sent/received dates;
+    # CreateItemFromTemplate creates an unsent draft and loses them.
+    msg = outlook.Session.OpenSharedItem(src_path)
 
     subject = msg.Subject or "(No Subject)"
     sender_name = msg.SenderName or ""
@@ -229,13 +237,17 @@ def _msg_to_pdf(src_path, out_pdf_path, log_fn):
         from_display = "Unknown"
 
     sent_date = None
-    try:
-        sent_date = msg.SentOn
-    except Exception:
+    for attr in ('SentOn', 'ReceivedTime', 'CreationTime', 'LastModificationTime'):
         try:
-            sent_date = msg.ReceivedTime
+            val = getattr(msg, attr, None)
+            if val is not None:
+                # Outlook uses 1/1/4501 as "no date" sentinel
+                if hasattr(val, 'year') and val.year > 4000:
+                    continue
+                sent_date = val
+                break
         except Exception:
-            pass
+            continue
     date_str = _format_email_datetime(sent_date)
 
     body_html = None
@@ -258,27 +270,8 @@ def _msg_to_pdf(src_path, out_pdf_path, log_fn):
         body_html=body_content,
     )
 
-    time.sleep(OUTLOOK_AFTER_MSG_SETTLE)
-
-    html_path = out_pdf_path.replace('.pdf', '.html')
-    with open(html_path, 'w', encoding='utf-8') as f:
+    with open(out_html_path, 'w', encoding='utf-8') as f:
         f.write(full_html)
-    time.sleep(HTML_TO_DISK_SETTLE)
-
-    word = _create_word_app()
-    try:
-        doc = _open_doc_with_retry(word, html_path, log_fn)
-        _save_pdf_with_retry(doc, out_pdf_path, log_fn)
-        doc.Close(False)
-        time.sleep(DOC_CLOSE_SETTLE)
-    finally:
-        word.Quit()
-        time.sleep(APP_QUIT_SETTLE)
-
-    try:
-        os.remove(html_path)
-    except Exception:
-        pass
 
 
 def _get_page_limit(filename, rules):
@@ -301,6 +294,8 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
     def log_fn(text):
         msg_queue.put(("log", text))
 
+    word = _WordApp()
+
     try:
         from pypdf import PdfReader, PdfWriter
 
@@ -317,6 +312,14 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
             return
 
         total = len(entries)
+        needs_word = any(
+            os.path.splitext(f)[1].lower() in ('.doc', '.docx', '.msg')
+            for f in entries)
+
+        if needs_word:
+            log_fn("Starting Word (reused for all conversions) ...")
+            word._ensure()
+
         log_fn(f"Found {total} file(s) to process.\n")
 
         temp_dir = tempfile.mkdtemp(prefix='BundleTool_')
@@ -341,14 +344,19 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
                     pdf_path = src
                 elif ext in ('.doc', '.docx'):
                     pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
-                    _word_to_pdf(src, pdf_path, log_fn)
+                    word.open_and_save_pdf(src, pdf_path, log_fn)
                 elif ext == '.msg':
+                    html_path = os.path.join(temp_dir, f"conv_{idx}.html")
                     pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
-                    _msg_to_pdf(src, pdf_path, log_fn)
+                    _msg_to_html(src, html_path)
+                    word.open_and_save_pdf(html_path, pdf_path, log_fn)
+                    try:
+                        os.remove(html_path)
+                    except Exception:
+                        pass
                 else:
                     continue
 
-                time.sleep(1.0)
                 reader = PdfReader(pdf_path)
                 num_pages = len(reader.pages)
 
@@ -366,7 +374,7 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
                 log_fn(f"    FAILED: {e}")
                 log_fn(traceback.format_exc())
 
-            time.sleep(INTER_FILE_DELAY)
+        word.quit()
 
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -395,6 +403,7 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
         msg_queue.put(("log", traceback.format_exc()))
         msg_queue.put(("done", False, None))
     finally:
+        word.quit()
         pythoncom.CoUninitialize()
 
 
