@@ -1,0 +1,33 @@
+# Build outputs (but we track the installer and portable exe for sharing)
+build/
+dist/
+!dist/Create_Bundle.exe
+Output/
+!Output/Create_Bundle_Setup.exe
+*.spec.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+*.egg-info/
+.eggs/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config (if any)
+*.local

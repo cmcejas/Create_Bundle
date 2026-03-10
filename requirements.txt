@@ -1,0 +1,4 @@
+customtkinter
+pypdf
+comtypes
+pywin32
