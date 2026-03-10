@@ -1,8 +1,8 @@
 # Build outputs (but we track the installer and portable exe for sharing)
 build/
-dist/
+dist/*
 !dist/Create_Bundle.exe
-Output/
+Output/*
 !Output/Create_Bundle_Setup.exe
 *.spec.bak
 
