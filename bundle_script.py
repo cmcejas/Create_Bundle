@@ -125,12 +125,37 @@ def _extract_html_body(html_source):
 
 
 def _format_email_datetime(dt):
+    """Format Outlook COM date as Day Month Year HH:MM (e.g. 06 May 2025 16:17)."""
     if dt is None:
         return "Unknown"
+    # Python datetime or pywintypes.datetime with strftime
     try:
-        return dt.strftime("%d/%m/%Y %H:%M")
+        return dt.strftime("%d %B %Y %H:%M")
     except Exception:
-        return str(dt)
+        pass
+    # OLE Automation date (float: days since 30 Dec 1899)
+    try:
+        if isinstance(dt, (int, float)):
+            base = datetime.datetime(1899, 12, 30)
+            d = base + datetime.timedelta(days=float(dt))
+            return d.strftime("%d %B %Y %H:%M")
+    except Exception:
+        pass
+    # COM-style attributes (Year, Month, Day, Hour, Minute)
+    try:
+        y = getattr(dt, 'Year', None) or getattr(dt, 'year', None)
+        m = getattr(dt, 'Month', None) or getattr(dt, 'month', None)
+        d = getattr(dt, 'Day', None) or getattr(dt, 'day', None)
+        hr = getattr(dt, 'Hour', None) or getattr(dt, 'hour', 0)
+        mn = getattr(dt, 'Minute', None) or getattr(dt, 'minute', 0)
+        if y is not None and m is not None and d is not None and y < 4000:
+            months = (None, 'January', 'February', 'March', 'April', 'May', 'June',
+                      'July', 'August', 'September', 'October', 'November', 'December')
+            month_name = months[int(m)] if 1 <= int(m) <= 12 else str(m)
+            return f"{int(d):02d} {month_name} {int(y):04d} {int(hr):02d}:{int(mn):02d}"
+    except Exception:
+        pass
+    return str(dt)
 
 
 # ── Reusable COM wrapper (one Word instance for the entire run) ──────────────
@@ -216,7 +241,8 @@ def _msg_to_html(src_path, out_html_path):
     outlook = win32com.client.Dispatch('Outlook.Application')
     # OpenSharedItem preserves the original sent/received dates;
     # CreateItemFromTemplate creates an unsent draft and loses them.
-    msg = outlook.Session.OpenSharedItem(src_path)
+    abs_path = os.path.abspath(src_path)
+    msg = outlook.Session.OpenSharedItem(abs_path)
 
     subject = msg.Subject or "(No Subject)"
     sender_name = msg.SenderName or ""
@@ -240,12 +266,16 @@ def _msg_to_html(src_path, out_html_path):
     for attr in ('SentOn', 'ReceivedTime', 'CreationTime', 'LastModificationTime'):
         try:
             val = getattr(msg, attr, None)
-            if val is not None:
-                # Outlook uses 1/1/4501 as "no date" sentinel
-                if hasattr(val, 'year') and val.year > 4000:
-                    continue
-                sent_date = val
-                break
+            if val is None:
+                continue
+            # Outlook uses 1/1/4501 as "no date" sentinel; COM may use .Year or .year
+            year = getattr(val, 'Year', None)
+            if year is None:
+                year = getattr(val, 'year', None)
+            if year is not None and int(year) > 4000:
+                continue
+            sent_date = val
+            break
         except Exception:
             continue
     date_str = _format_email_datetime(sent_date)
