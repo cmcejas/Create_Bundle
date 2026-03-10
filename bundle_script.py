@@ -292,12 +292,23 @@ def _msg_to_html(src_path, out_html_path):
         plain_body = msg.Body or ""
         body_content = html_mod.escape(plain_body).replace('\n', '<br>\n')
 
+    # Close the msg item so Outlook doesn't accumulate open items
+    try:
+        msg.Close(1)  # olDiscard
+    except Exception:
+        pass
+
+    # Escape curly braces in all fields so .format() doesn't choke on
+    # CSS/JS in the email body (e.g. "div { color: red; }" → KeyError).
+    def _safe(s):
+        return s.replace('{', '{{').replace('}', '}}')
+
     full_html = EMAIL_HTML_TEMPLATE.format(
-        from_field=from_display,
-        to_field=html_mod.escape(to_field) if to_field else "Unknown",
-        date_field=html_mod.escape(date_str),
-        subject_field=html_mod.escape(subject),
-        body_html=body_content,
+        from_field=_safe(from_display),
+        to_field=_safe(html_mod.escape(to_field) if to_field else "Unknown"),
+        date_field=_safe(html_mod.escape(date_str)),
+        subject_field=_safe(html_mod.escape(subject)),
+        body_html=_safe(body_content),
     )
 
     with open(out_html_path, 'w', encoding='utf-8') as f:
