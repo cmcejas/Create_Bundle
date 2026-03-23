@@ -1,6 +1,6 @@
 """
 Create_Bundle – PDF Bundler (GUI)
-Merges PDFs, Word docs, and Outlook .msg files into a single timestamped PDF.
+Merges PDFs, Word docs, Outlook .msg, and standard .eml emails into a single PDF.
 """
 
 import os
@@ -27,7 +27,7 @@ DOC_READY_TIMEOUT = 8.0         # max seconds to wait for doc to be ready
 FILE_STABLE_POLL = 0.2          # interval when checking output file
 FILE_STABLE_CHECKS = 2          # unchanged size checks before "stable"
 
-SUPPORTED_EXT = {'.pdf', '.doc', '.docx', '.msg'}
+SUPPORTED_EXT = {'.pdf', '.doc', '.docx', '.msg', '.eml'}
 
 EMAIL_HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -158,6 +158,25 @@ def _format_email_datetime(dt):
     return str(dt)
 
 
+def _word_com_path(path):
+    """
+    Absolute, normalized path for Word COM on Windows.
+
+    Forward-slash paths (e.g. C:/Users/...) are valid in Python but Word often
+    mis-resolves them as C:\\ + //server/... and fails with "couldn't find your file".
+
+    Note: Tkinter's filedialog.askdirectory() on Windows typically returns paths
+    with forward slashes, so this applies even when the user picks a folder in the GUI.
+    """
+    if not path:
+        return path
+    path = os.path.abspath(os.path.expanduser(str(path).strip()))
+    path = os.path.normpath(path)
+    if sys.platform == 'win32':
+        path = path.replace('/', '\\')
+    return path
+
+
 # ── Reusable COM wrapper (one Word instance for the entire run) ──────────────
 
 class _WordApp:
@@ -180,6 +199,8 @@ class _WordApp:
     def open_and_save_pdf(self, src_path, pdf_path, log_fn):
         """Open *src_path* in Word, save as PDF, close the document."""
         self._ensure()
+        src_path = _word_com_path(src_path)
+        pdf_path = _word_com_path(pdf_path)
         doc = self._open(src_path, log_fn)
         try:
             self._save_pdf(doc, pdf_path, log_fn)
@@ -198,9 +219,12 @@ class _WordApp:
             self._app = None
 
     def _open(self, path, log_fn):
+        path = _word_com_path(path)
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 self._ensure()
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(f"Word cannot open missing file: {path}")
                 doc = self._app.Documents.Open(path)
                 if doc is None:
                     raise RuntimeError("Word returned None")
@@ -234,6 +258,105 @@ class _WordApp:
                     raise
 
 
+def _finalize_email_html(from_display, to_field_plain, date_str_plain, subject_plain,
+                         body_content, out_html_path):
+    """Write EMAIL_HTML_TEMPLATE; escape braces so str.format() never breaks on CSS in bodies."""
+    def _safe(s):
+        if s is None:
+            s = ""
+        return str(s).replace('{', '{{').replace('}', '}}')
+
+    to_esc = html_mod.escape(to_field_plain) if to_field_plain else "Unknown"
+    date_esc = html_mod.escape(date_str_plain) if date_str_plain else "Unknown"
+    subj_esc = html_mod.escape(subject_plain) if subject_plain else "(No Subject)"
+
+    full_html = EMAIL_HTML_TEMPLATE.format(
+        from_field=_safe(from_display),
+        to_field=_safe(to_esc),
+        date_field=_safe(date_esc),
+        subject_field=_safe(subj_esc),
+        body_html=_safe(body_content),
+    )
+    with open(out_html_path, 'w', encoding='utf-8') as f:
+        f.write(full_html)
+
+
+def _eml_body_to_html_fragment(msg):
+    """Pick HTML or plain body from a parsed email (handles multipart)."""
+    part = msg.get_body(preferencelist=('html', 'plain'))
+    if part is not None:
+        try:
+            ctype = part.get_content_type()
+            payload = part.get_content()
+            if payload is None:
+                payload = ""
+            if ctype == 'text/html':
+                return _extract_html_body(str(payload))
+            return html_mod.escape(str(payload)).replace('\n', '<br>\n')
+        except Exception:
+            pass
+
+    html_found = None
+    plain_found = None
+    for p in msg.walk():
+        if p.get_content_maintype() != 'text':
+            continue
+        ctype = p.get_content_type()
+        try:
+            if ctype == 'text/html' and html_found is None:
+                html_found = p.get_content()
+            elif ctype == 'text/plain' and plain_found is None:
+                plain_found = p.get_content()
+        except Exception:
+            continue
+    if html_found is not None:
+        return _extract_html_body(str(html_found))
+    if plain_found is not None:
+        return html_mod.escape(str(plain_found)).replace('\n', '<br>\n')
+    return "<p><i>(No body)</i></p>"
+
+
+def _eml_to_html(src_path, out_html_path):
+    """Parse RFC 822 / MIME .eml and write the same styled HTML as .msg (no Outlook)."""
+    from email import policy
+    from email.parser import BytesParser
+    from email.utils import parsedate_to_datetime
+
+    with open(src_path, 'rb') as f:
+        raw = f.read()
+    msg = BytesParser(policy=policy.default).parsebytes(raw)
+
+    subject = str(msg.get('Subject') or '').strip() or "(No Subject)"
+    from_raw = str(msg.get('From') or '').strip()
+    to_raw = str(msg.get('To') or '').strip()
+    if not to_raw:
+        to_raw = (
+            str(msg.get('Delivered-To') or '')
+            or str(msg.get('X-Original-To') or '')
+            or str(msg.get('Envelope-To') or '')
+        ).strip()
+
+    if from_raw:
+        from_display = html_mod.escape(from_raw)
+    else:
+        from_display = "Unknown"
+
+    date_str = "Unknown"
+    date_hdr = msg.get('Date')
+    if date_hdr:
+        try:
+            dt = parsedate_to_datetime(str(date_hdr))
+            if dt is not None and dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            date_str = _format_email_datetime(dt)
+        except (TypeError, ValueError, OverflowError):
+            date_str = str(date_hdr).strip() or "Unknown"
+
+    body_content = _eml_body_to_html_fragment(msg)
+    _finalize_email_html(
+        from_display, to_raw, date_str, subject, body_content, out_html_path)
+
+
 def _msg_to_html(src_path, out_html_path):
     """Extract .msg metadata via Outlook COM and write a clean HTML file."""
     import win32com.client
@@ -241,7 +364,7 @@ def _msg_to_html(src_path, out_html_path):
     outlook = win32com.client.Dispatch('Outlook.Application')
     # OpenSharedItem preserves the original sent/received dates;
     # CreateItemFromTemplate creates an unsent draft and loses them.
-    abs_path = os.path.abspath(src_path)
+    abs_path = _word_com_path(src_path)
     msg = outlook.Session.OpenSharedItem(abs_path)
 
     subject = msg.Subject or "(No Subject)"
@@ -298,21 +421,8 @@ def _msg_to_html(src_path, out_html_path):
     except Exception:
         pass
 
-    # Escape curly braces in all fields so .format() doesn't choke on
-    # CSS/JS in the email body (e.g. "div { color: red; }" → KeyError).
-    def _safe(s):
-        return s.replace('{', '{{').replace('}', '}}')
-
-    full_html = EMAIL_HTML_TEMPLATE.format(
-        from_field=_safe(from_display),
-        to_field=_safe(html_mod.escape(to_field) if to_field else "Unknown"),
-        date_field=_safe(html_mod.escape(date_str)),
-        subject_field=_safe(html_mod.escape(subject)),
-        body_html=_safe(body_content),
-    )
-
-    with open(out_html_path, 'w', encoding='utf-8') as f:
-        f.write(full_html)
+    _finalize_email_html(
+        from_display, to_field, date_str, subject, body_content, out_html_path)
 
 
 def _get_page_limit(filename, rules):
@@ -354,7 +464,7 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
 
         total = len(entries)
         needs_word = any(
-            os.path.splitext(f)[1].lower() in ('.doc', '.docx', '.msg')
+            os.path.splitext(f)[1].lower() in ('.doc', '.docx', '.msg', '.eml')
             for f in entries)
 
         if needs_word:
@@ -390,6 +500,15 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
                     html_path = os.path.join(temp_dir, f"conv_{idx}.html")
                     pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
                     _msg_to_html(src, html_path)
+                    word.open_and_save_pdf(html_path, pdf_path, log_fn)
+                    try:
+                        os.remove(html_path)
+                    except Exception:
+                        pass
+                elif ext == '.eml':
+                    html_path = os.path.join(temp_dir, f"conv_{idx}.html")
+                    pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
+                    _eml_to_html(src, html_path)
                     word.open_and_save_pdf(html_path, pdf_path, log_fn)
                     try:
                         os.remove(html_path)
@@ -589,7 +708,7 @@ class BundleApp(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             frm,
-            text="Merge PDFs, Word documents and Outlook emails into one PDF.",
+            text="Merge PDFs, Word docs, Outlook .msg / .eml emails into one PDF.",
             font=ctk.CTkFont(size=13), text_color="gray",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -757,8 +876,8 @@ class BundleApp(ctk.CTk):
         default_input = os.path.join(self._root_dir, 'INPUT')
         default_output = os.path.join(self._root_dir, 'OUTPUT')
 
-        self._input_var.set(default_input)
-        self._output_var.set(default_output)
+        self._input_var.set(_word_com_path(default_input))
+        self._output_var.set(_word_com_path(default_output))
         self._refresh_file_count()
 
         config_path = os.path.join(default_input, 'config.txt')
@@ -785,6 +904,7 @@ class BundleApp(ctk.CTk):
             title="Select Input Folder", initialdir=initial)
         if not path:
             return
+        path = _word_com_path(path)
         self._input_var.set(path)
         self._refresh_file_count()
 
@@ -801,7 +921,7 @@ class BundleApp(ctk.CTk):
         path = filedialog.askdirectory(
             title="Select Output Folder", initialdir=initial)
         if path:
-            self._output_var.set(path)
+            self._output_var.set(_word_com_path(path))
 
     def _open_output_folder(self):
         path = self._output_var.get().strip()
@@ -820,7 +940,7 @@ class BundleApp(ctk.CTk):
             and os.path.splitext(f)[1].lower() in SUPPORTED_EXT)
         if count == 0:
             self._file_count_label.configure(
-                text="  No supported files found (pdf, doc, docx, msg)",
+                text="  No supported files found (pdf, doc, docx, msg, eml)",
                 text_color=ORANGE)
         else:
             self._file_count_label.configure(
@@ -891,8 +1011,10 @@ class BundleApp(ctk.CTk):
             self._action_btn.configure(text="Cancelling ...", state="disabled")
             return
 
-        input_dir = self._input_var.get().strip()
-        output_dir = self._output_var.get().strip()
+        input_dir = _word_com_path(self._input_var.get().strip())
+        output_dir = _word_com_path(self._output_var.get().strip())
+        self._input_var.set(input_dir)
+        self._output_var.set(output_dir)
 
         if not input_dir or not os.path.isdir(input_dir):
             messagebox.showerror("Error", "Please select a valid input folder.")

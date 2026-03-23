@@ -1,6 +1,6 @@
 # Create Bundle – PDF Bundler
 
-A Windows desktop app that merges **PDFs**, **Word documents** (`.doc`/`.docx`), and **Outlook emails** (`.msg`) into a single timestamped PDF. Built with Python, CustomTkinter, and Word/Outlook COM.
+A Windows desktop app that merges **PDFs**, **Word documents** (`.doc`/`.docx`), and **emails** (Outlook **`.msg`** and standard **`.eml`**) into a single timestamped PDF. Built with Python, CustomTkinter, and Word (Outlook COM is only needed for `.msg`).
 
 ## Download (for end users)
 
@@ -16,13 +16,13 @@ Both files are checked into the repo so you can share the GitHub link with colle
 
 - **GUI** – Simple interface: choose input/output folders, set page rules, run the bundle.
 - **Page rules** – Limit how many pages are included per file by filename keyword (e.g. files with “email” in the name → 1 page). Configure in the app or via `config.txt` in the input folder.
-- **Email formatting** – Converts `.msg` to PDF with a clean header (From, To, Date dd/mm/yyyy, Time HH:MM, Subject) and consistent layout.
+- **Email formatting** – Converts `.msg` (Outlook) and `.eml` (RFC 822) to PDF with the same clean header (From, To, Date, Subject) and consistent layout.
 - **Single exe** – One self-contained `.exe` you can copy to any Windows PC (no Python or installer required).
 - **Optional installer** – Inno Setup installer, no admin rights; installs per user.
 
 ## Requirements
 
-- **Windows** (Word and Outlook for full functionality; PDF-only works without them).
+- **Windows** – **Word** is required to convert Word docs and emails to PDF. **Outlook** is only required for **`.msg`** files; **`.eml`** files are parsed in Python (no Outlook).
 - To run from source: **Python 3.10+**, and the packages in `requirements.txt`.
 
 ## Run from source
@@ -33,7 +33,7 @@ pip install -r requirements.txt
 python bundle_script.py
 ```
 
-Create an **INPUT** folder next to the script (or set it in the app), put your PDFs/Word/`.msg` files there, set the **OUTPUT** folder, and click **Create Bundle**.
+Create an **INPUT** folder next to the script (or set it in the app), put your PDFs, Word files, `.msg` / `.eml` emails there, set the **OUTPUT** folder, and click **Create Bundle**.
 
 ## Build the exe and installer
 
