@@ -385,23 +385,26 @@ def _msg_to_html(src_path, out_html_path):
     else:
         from_display = "Unknown"
 
-    sent_date = None
+    date_str = "Unknown"
     for attr in ('SentOn', 'ReceivedTime', 'CreationTime', 'LastModificationTime'):
         try:
             val = getattr(msg, attr, None)
             if val is None:
                 continue
-            # Outlook uses 1/1/4501 as "no date" sentinel; COM may use .Year or .year
-            year = getattr(val, 'Year', None)
-            if year is None:
-                year = getattr(val, 'year', None)
-            if year is not None and int(year) > 4000:
+            # Convert pywintypes.datetime to plain Python datetime immediately.
+            # Accessing .year/.month/.day on the COM object here is safe; passing
+            # the object downstream to _format_email_datetime() is not — it can
+            # silently fail in edge cases (timezone issues, sentinel values, etc.).
+            dt = datetime.datetime(
+                val.year, val.month, val.day,
+                val.hour, val.minute, val.second
+            )
+            if dt.year > 4000:
                 continue
-            sent_date = val
+            date_str = dt.strftime("%d %B %Y %H:%M")
             break
         except Exception:
             continue
-    date_str = _format_email_datetime(sent_date)
 
     body_html = None
     try:
