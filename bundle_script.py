@@ -1,6 +1,6 @@
 """
 Create_Bundle – PDF Bundler (GUI)
-Merges PDFs, Word docs, Outlook .msg, and standard .eml emails into a single PDF.
+Merges PDFs, Word docs, and Outlook .msg emails into a single PDF.
 """
 
 import os
@@ -27,7 +27,7 @@ DOC_READY_TIMEOUT = 8.0         # max seconds to wait for doc to be ready
 FILE_STABLE_POLL = 0.2          # interval when checking output file
 FILE_STABLE_CHECKS = 2          # unchanged size checks before "stable"
 
-SUPPORTED_EXT = {'.pdf', '.doc', '.docx', '.msg', '.eml'}
+SUPPORTED_EXT = {'.pdf', '.doc', '.docx', '.msg'}
 
 EMAIL_HTML_TEMPLATE = """\
 <!DOCTYPE html>
@@ -82,6 +82,55 @@ def _base_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# ── System checks ────────────────────────────────────────────────────────────
+
+def _check_word_available():
+    """
+    Check if Microsoft Word is installed and available via COM.
+    Returns True if available, False otherwise.
+    """
+    try:
+        import comtypes.client
+        app = comtypes.client.CreateObject('Word.Application')
+        app.Quit()
+        return True
+    except Exception:
+        return False
+
+
+def _show_word_missing_dialog():
+    """Show a user-friendly dialog explaining Word is required."""
+    # Delay import to avoid early tkinter initialization
+    from tkinter import messagebox as msg
+    msg.showwarning(
+        "Microsoft Word Required",
+        "Microsoft Word is required to convert Word documents and emails to PDF.\n\n"
+        "Please install Microsoft Word from:\n"
+        "  https://www.microsoft.com/office\n\n"
+        "You can still work with PDF files without Word.\n"
+        "The app will continue, but Word-dependent files will fail to process."
+    )
+
+
+def _check_system_requirements():
+    """
+    Perform startup checks and warn user if requirements are missing.
+    Run this after Tkinter is initialized but before showing main window.
+    """
+    if sys.platform != 'win32':
+        from tkinter import messagebox as msg
+        msg.showerror(
+            "Windows Only",
+            "This app is designed for Windows only.\n\n"
+            f"Detected OS: {sys.platform}"
+        )
+        sys.exit(1)
+    
+    word_available = _check_word_available()
+    if not word_available:
+        _show_word_missing_dialog()
+
+
 # ── Processing helpers ───────────────────────────────────────────────────────
 
 def _wait_file_stable(filepath, timeout=6.0):
@@ -124,13 +173,31 @@ def _extract_html_body(html_source):
     return match.group(1) if match else html_source
 
 
+# Hardcoded English month names — strftime("%B") is locale-dependent and
+# produces non-English names on French, German, etc. Windows installs.
+_MONTH_NAMES = (
+    None, 'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+)
+
+
+def _safe_strftime(dt):
+    """Format a datetime as 'DD Month YYYY HH:MM' using hardcoded English months."""
+    return (f"{dt.day:02d} {_MONTH_NAMES[dt.month]} "
+            f"{dt.year:04d} {dt.hour:02d}:{dt.minute:02d}")
+
+
 def _format_email_datetime(dt):
-    """Format Outlook COM date as Day Month Year HH:MM (e.g. 06 May 2025 16:17)."""
+    """Format Outlook COM date as Day Month Year HH:MM (e.g. 06 May 2025 16:17).
+
+    Uses hardcoded English month names so the output is identical regardless
+    of the Windows display-language / locale on the machine.
+    """
     if dt is None:
         return "Unknown"
-    # Python datetime or pywintypes.datetime with strftime
+    # Python datetime or pywintypes.datetime
     try:
-        return dt.strftime("%d %B %Y %H:%M")
+        return _safe_strftime(dt)
     except Exception:
         pass
     # OLE Automation date (float: days since 30 Dec 1899)
@@ -138,7 +205,7 @@ def _format_email_datetime(dt):
         if isinstance(dt, (int, float)):
             base = datetime.datetime(1899, 12, 30)
             d = base + datetime.timedelta(days=float(dt))
-            return d.strftime("%d %B %Y %H:%M")
+            return _safe_strftime(d)
     except Exception:
         pass
     # COM-style attributes (Year, Month, Day, Hour, Minute)
@@ -149,13 +216,33 @@ def _format_email_datetime(dt):
         hr = getattr(dt, 'Hour', None) or getattr(dt, 'hour', 0)
         mn = getattr(dt, 'Minute', None) or getattr(dt, 'minute', 0)
         if y is not None and m is not None and d is not None and y < 4000:
-            months = (None, 'January', 'February', 'March', 'April', 'May', 'June',
-                      'July', 'August', 'September', 'October', 'November', 'December')
-            month_name = months[int(m)] if 1 <= int(m) <= 12 else str(m)
+            month_name = _MONTH_NAMES[int(m)] if 1 <= int(m) <= 12 else str(m)
             return f"{int(d):02d} {month_name} {int(y):04d} {int(hr):02d}:{int(mn):02d}"
     except Exception:
         pass
     return str(dt)
+
+
+# Expected pattern: "DD Month YYYY HH:MM"  e.g. "06 May 2025 16:17"
+_DATE_PATTERN = re.compile(
+    r'^\d{2} (?:' + '|'.join(_MONTH_NAMES[1:]) + r') \d{4} \d{2}:\d{2}$'
+)
+
+
+def _validate_date(date_str, filepath, source_label):
+    """Check the extracted date matches 'DD Month YYYY HH:MM'.
+
+    Returns None if valid, or a warning string if the date looks wrong.
+    The caller is responsible for logging the warning.
+    """
+    filename = os.path.basename(filepath)
+    if date_str == "Unknown":
+        return (f"⚠ DATE WARNING [{filename}]: No date found "
+                f"(tried: {source_label})")
+    if not _DATE_PATTERN.match(date_str):
+        return (f"⚠ DATE WARNING [{filename}]: Unexpected format '{date_str}' "
+                f"(source: {source_label}) — expected 'DD Month YYYY HH:MM'")
+    return None
 
 
 def _word_com_path(path):
@@ -175,6 +262,184 @@ def _word_com_path(path):
     if sys.platform == 'win32':
         path = path.replace('/', '\\')
     return path
+
+
+# Formats that str(pywintypes.datetime) can produce depending on the
+# Windows locale / pywin32 version.  We try each in order.
+_PYWINTYPES_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",       # ISO  (most common)
+    "%m/%d/%Y %H:%M:%S",       # US locale  24h
+    "%d/%m/%Y %H:%M:%S",       # UK / EU locale 24h
+    "%Y-%m-%dT%H:%M:%S",       # ISO with T separator
+    "%d-%m-%Y %H:%M:%S",       # dash-separated EU
+    "%m-%d-%Y %H:%M:%S",       # dash-separated US
+    "%m/%d/%y %H:%M:%S",       # US locale short year
+    "%d/%m/%y %H:%M:%S",       # EU locale short year
+)
+
+# Some locales produce 12-hour times with AM/PM — handled separately below.
+_PYWINTYPES_FORMATS_AMPM = (
+    "%m/%d/%Y %I:%M:%S %p",    # US 12-hour
+    "%d/%m/%Y %I:%M:%S %p",    # UK 12-hour
+    "%Y-%m-%d %I:%M:%S %p",    # ISO 12-hour (rare)
+)
+
+# Years that represent "not set" / null OLE dates
+_BOGUS_YEARS = {1601, 1899, 1900, 4501}
+
+
+def _is_plausible_date(dt):
+    """Return True if *dt* looks like a real email date, not a null/epoch placeholder."""
+    if dt is None:
+        return False
+    return 1970 <= dt.year <= 2100 and dt.year not in _BOGUS_YEARS
+
+
+def _parse_pywintypes_date(val):
+    """
+    Reliably convert a pywintypes.datetime COM object to a plain Python datetime.
+
+    str(pywintypes.datetime) output varies by Windows locale:
+      - English/ISO:  "2025-05-06 16:17:00+00:00"
+      - US locale:    "05/06/2025 16:17:00"
+      - UK/EU locale: "06/05/2025 16:17:00"
+      - US 12-hour:   "5/6/2025 4:17:00 PM"
+
+    We try every known format so the date is parsed correctly on any machine.
+    """
+    if val is None:
+        return None
+
+    # 1) If it's already a Python datetime (pywintypes.datetime is a subclass),
+    #    convert timezone-aware to local time, then strip tzinfo.
+    if isinstance(val, datetime.datetime):
+        try:
+            dt = val
+            if dt.tzinfo is not None:
+                dt = dt.astimezone().replace(tzinfo=None)
+            if _is_plausible_date(dt):
+                return dt
+        except (OverflowError, OSError, Exception):
+            pass
+
+    # 2) Direct attribute access — works on genuine pywintypes.datetime
+    try:
+        dt = datetime.datetime(
+            year=val.year, month=val.month, day=val.day,
+            hour=val.hour, minute=val.minute, second=val.second)
+        if _is_plausible_date(dt):
+            return dt
+    except Exception:
+        pass
+
+    # 3) timetuple() — more robust on some pywin32 builds where .year etc throw
+    try:
+        tt = val.timetuple()
+        dt = datetime.datetime(*tt[:6])
+        if _is_plausible_date(dt):
+            return dt
+    except Exception:
+        pass
+
+    # 4) OLE Automation float (days since 30 Dec 1899)
+    try:
+        if isinstance(val, (int, float)):
+            base = datetime.datetime(1899, 12, 30)
+            dt = base + datetime.timedelta(days=float(val))
+            if _is_plausible_date(dt):
+                return dt
+    except Exception:
+        pass
+
+    # 5) Parse string representation
+    raw_full = str(val).strip()
+    raw = raw_full[:19]  # drop timezone suffix for 24-hour formats
+
+    for fmt in _PYWINTYPES_FORMATS:
+        try:
+            dt = datetime.datetime.strptime(raw, fmt)
+            if _is_plausible_date(dt):
+                return dt
+        except (ValueError, TypeError):
+            continue
+
+    # 6) AM/PM formats need the full string (not truncated to 19 chars)
+    #    Strip timezone suffix like "+00:00" but keep AM/PM
+    raw_notz = re.sub(r'[+-]\d{2}:\d{2}$', '', raw_full).strip()
+    for fmt in _PYWINTYPES_FORMATS_AMPM:
+        try:
+            dt = datetime.datetime.strptime(raw_notz, fmt)
+            if _is_plausible_date(dt):
+                return dt
+        except (ValueError, TypeError):
+            continue
+
+    return None
+
+
+def _parse_date_from_transport_headers(msg_com):
+    """Extract Date from the raw SMTP transport headers stored in the .msg.
+
+    Outlook stores the original RFC 2822 headers as PR_TRANSPORT_MESSAGE_HEADERS.
+    This is the most reliable date source for sent items / first-in-chain emails
+    where SentOn / ReceivedTime can be empty.
+    """
+    from email.utils import parsedate_to_datetime
+
+    try:
+        headers = msg_com.PropertyAccessor.GetProperty(
+            "http://schemas.microsoft.com/mapi/proptag/0x007D001F")
+    except Exception:
+        return None
+    if not headers:
+        return None
+    match = re.search(r'^Date:\s*(.+)$', headers, re.MULTILINE | re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        dt = parsedate_to_datetime(match.group(1).strip())
+        if dt is not None and dt.tzinfo is not None:
+            dt = dt.astimezone().replace(tzinfo=None)
+        if _is_plausible_date(dt):
+            return dt
+    except Exception:
+        pass
+    return None
+
+
+# MAPI property tags that store dates — used as fallback when the COM model
+# properties (SentOn, ReceivedTime, …) return null/bogus values.
+_MAPI_DATE_TAGS = (
+    # (display label, MAPI proptag URL)
+    ('PR_CLIENT_SUBMIT_TIME',
+     'http://schemas.microsoft.com/mapi/proptag/0x00390040'),
+    ('PR_MESSAGE_DELIVERY_TIME',
+     'http://schemas.microsoft.com/mapi/proptag/0x0E060040'),
+    ('PR_CREATION_TIME',
+     'http://schemas.microsoft.com/mapi/proptag/0x30070040'),
+    ('PR_LAST_MODIFICATION_TIME',
+     'http://schemas.microsoft.com/mapi/proptag/0x30080040'),
+)
+
+
+def _parse_date_from_mapi_props(msg_com):
+    """Try raw MAPI property tags via PropertyAccessor.
+
+    These can succeed when the higher-level model properties (SentOn etc.) fail,
+    especially for sent items and calendar-originated messages.
+    Returns (datetime, source_label) or (None, None).
+    """
+    for label, tag in _MAPI_DATE_TAGS:
+        try:
+            val = msg_com.PropertyAccessor.GetProperty(tag)
+            if val is None:
+                continue
+            dt = _parse_pywintypes_date(val)
+            if dt is not None:
+                return dt, label
+        except Exception:
+            continue
+    return None, None
 
 
 # ── Reusable COM wrapper (one Word instance for the entire run) ──────────────
@@ -281,82 +546,6 @@ def _finalize_email_html(from_display, to_field_plain, date_str_plain, subject_p
         f.write(full_html)
 
 
-def _eml_body_to_html_fragment(msg):
-    """Pick HTML or plain body from a parsed email (handles multipart)."""
-    part = msg.get_body(preferencelist=('html', 'plain'))
-    if part is not None:
-        try:
-            ctype = part.get_content_type()
-            payload = part.get_content()
-            if payload is None:
-                payload = ""
-            if ctype == 'text/html':
-                return _extract_html_body(str(payload))
-            return html_mod.escape(str(payload)).replace('\n', '<br>\n')
-        except Exception:
-            pass
-
-    html_found = None
-    plain_found = None
-    for p in msg.walk():
-        if p.get_content_maintype() != 'text':
-            continue
-        ctype = p.get_content_type()
-        try:
-            if ctype == 'text/html' and html_found is None:
-                html_found = p.get_content()
-            elif ctype == 'text/plain' and plain_found is None:
-                plain_found = p.get_content()
-        except Exception:
-            continue
-    if html_found is not None:
-        return _extract_html_body(str(html_found))
-    if plain_found is not None:
-        return html_mod.escape(str(plain_found)).replace('\n', '<br>\n')
-    return "<p><i>(No body)</i></p>"
-
-
-def _eml_to_html(src_path, out_html_path):
-    """Parse RFC 822 / MIME .eml and write the same styled HTML as .msg (no Outlook)."""
-    from email import policy
-    from email.parser import BytesParser
-    from email.utils import parsedate_to_datetime
-
-    with open(src_path, 'rb') as f:
-        raw = f.read()
-    msg = BytesParser(policy=policy.default).parsebytes(raw)
-
-    subject = str(msg.get('Subject') or '').strip() or "(No Subject)"
-    from_raw = str(msg.get('From') or '').strip()
-    to_raw = str(msg.get('To') or '').strip()
-    if not to_raw:
-        to_raw = (
-            str(msg.get('Delivered-To') or '')
-            or str(msg.get('X-Original-To') or '')
-            or str(msg.get('Envelope-To') or '')
-        ).strip()
-
-    if from_raw:
-        from_display = html_mod.escape(from_raw)
-    else:
-        from_display = "Unknown"
-
-    date_str = "Unknown"
-    date_hdr = msg.get('Date')
-    if date_hdr:
-        try:
-            dt = parsedate_to_datetime(str(date_hdr))
-            if dt is not None and dt.tzinfo is not None:
-                dt = dt.astimezone().replace(tzinfo=None)
-            date_str = _format_email_datetime(dt)
-        except (TypeError, ValueError, OverflowError):
-            date_str = str(date_hdr).strip() or "Unknown"
-
-    body_content = _eml_body_to_html_fragment(msg)
-    _finalize_email_html(
-        from_display, to_raw, date_str, subject, body_content, out_html_path)
-
-
 def _msg_to_html(src_path, out_html_path):
     """Extract .msg metadata via Outlook COM and write a clean HTML file."""
     import win32com.client
@@ -386,25 +575,51 @@ def _msg_to_html(src_path, out_html_path):
         from_display = "Unknown"
 
     date_str = "Unknown"
+    date_source = None
     for attr in ('SentOn', 'ReceivedTime', 'CreationTime', 'LastModificationTime'):
         try:
             val = getattr(msg, attr, None)
             if val is None:
                 continue
-            # Convert pywintypes.datetime to plain Python datetime immediately.
-            # Accessing .year/.month/.day on the COM object here is safe; passing
-            # the object downstream to _format_email_datetime() is not — it can
-            # silently fail in edge cases (timezone issues, sentinel values, etc.).
-            dt = datetime.datetime(
-                val.year, val.month, val.day,
-                val.hour, val.minute, val.second
-            )
-            if dt.year > 4000:
+            dt = _parse_pywintypes_date(val)
+            if dt is None:
                 continue
-            date_str = dt.strftime("%d %B %Y %H:%M")
+            date_str = _safe_strftime(dt)
+            date_source = attr
             break
         except Exception:
             continue
+
+    # Fallback: parse date from raw transport headers (most reliable for
+    # sent items / first email in a chain where COM properties can be empty)
+    if date_str == "Unknown":
+        dt = _parse_date_from_transport_headers(msg)
+        if dt is not None:
+            date_str = _safe_strftime(dt)
+            date_source = 'TransportHeaders'
+
+    # Fallback: try raw MAPI property tags via PropertyAccessor
+    if date_str == "Unknown":
+        dt, mapi_label = _parse_date_from_mapi_props(msg)
+        if dt is not None:
+            date_str = _safe_strftime(dt)
+            date_source = mapi_label
+
+    # Last resort: use the raw str() of whichever COM date property has a value.
+    # This may look ugly (e.g. "2025-05-06 16:17:00+00:00") but guarantees
+    # the date field in the PDF is never blank.
+    if date_str == "Unknown":
+        for attr in ('SentOn', 'ReceivedTime', 'CreationTime', 'LastModificationTime'):
+            try:
+                val = getattr(msg, attr, None)
+                if val is not None:
+                    raw = str(val).strip()
+                    if raw and raw != 'None':
+                        date_str = raw
+                        date_source = f'{attr} (raw)'
+                        break
+            except Exception:
+                continue
 
     body_html = None
     try:
@@ -424,8 +639,99 @@ def _msg_to_html(src_path, out_html_path):
     except Exception:
         pass
 
+    date_warning = _validate_date(date_str, src_path,
+                                    date_source or 'SentOn/ReceivedTime/CreationTime')
     _finalize_email_html(
         from_display, to_field, date_str, subject, body_content, out_html_path)
+    return date_warning
+
+
+def _msg_to_html_fallback(src_path, out_html_path):
+    """Parse .msg using extract-msg (pure Python) when Outlook is not installed."""
+    import extract_msg
+
+    msg = extract_msg.Message(src_path)
+    try:
+        subject = msg.subject or "(No Subject)"
+        sender_name = msg.senderName or ""
+        sender_email = msg.sender or ""
+        # extract-msg stores recipients as a string
+        to_field = msg.to or ""
+
+        if sender_email.startswith('/'):
+            sender_email = ""
+
+        if sender_email and sender_name:
+            from_display = (f"{html_mod.escape(sender_name)} "
+                            f"&lt;{html_mod.escape(sender_email)}&gt;")
+        elif sender_name:
+            from_display = html_mod.escape(sender_name)
+        elif sender_email:
+            from_display = html_mod.escape(sender_email)
+        else:
+            from_display = "Unknown"
+
+        # extract-msg exposes .date as a string like "Mon, 6 May 2025 16:17:00 +0100"
+        date_str = "Unknown"
+        date_source = None
+        raw_date = msg.date
+        if raw_date:
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(str(raw_date))
+                if dt is not None and dt.tzinfo is not None:
+                    dt = dt.astimezone().replace(tzinfo=None)
+                if _is_plausible_date(dt):
+                    date_str = _safe_strftime(dt)
+                    date_source = 'msg.date'
+            except Exception:
+                date_str = str(raw_date).strip() or "Unknown"
+                date_source = 'msg.date (raw)'
+
+        # Fallback: try transport headers embedded in the .msg
+        if date_str == "Unknown":
+            try:
+                headers = msg.headerDict or {}
+                hdr_date = headers.get('Date') or headers.get('date')
+                if hdr_date:
+                    from email.utils import parsedate_to_datetime
+                    dt = parsedate_to_datetime(str(hdr_date))
+                    if dt is not None and dt.tzinfo is not None:
+                        dt = dt.astimezone().replace(tzinfo=None)
+                    if _is_plausible_date(dt):
+                        date_str = _safe_strftime(dt)
+                        date_source = 'headerDict.Date'
+            except Exception:
+                pass
+
+        # Last resort: use the raw .date string as-is
+        if date_str == "Unknown" and raw_date:
+            raw = str(raw_date).strip()
+            if raw and raw != 'None':
+                date_str = raw
+                date_source = 'msg.date (raw fallback)'
+
+        body_html = None
+        try:
+            body_html = msg.htmlBody
+            if isinstance(body_html, bytes):
+                body_html = body_html.decode('utf-8', errors='replace')
+        except Exception:
+            pass
+
+        if body_html:
+            body_content = _extract_html_body(body_html)
+        else:
+            plain_body = msg.body or ""
+            body_content = html_mod.escape(plain_body).replace('\n', '<br>\n')
+
+        date_warning = _validate_date(date_str, src_path,
+                                      date_source or 'msg.date')
+        _finalize_email_html(
+            from_display, to_field, date_str, subject, body_content, out_html_path)
+        return date_warning
+    finally:
+        msg.close()
 
 
 def _get_page_limit(filename, rules):
@@ -467,12 +773,21 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
 
         total = len(entries)
         needs_word = any(
-            os.path.splitext(f)[1].lower() in ('.doc', '.docx', '.msg', '.eml')
+            os.path.splitext(f)[1].lower() in ('.doc', '.docx', '.msg')
             for f in entries)
 
         if needs_word:
             log_fn("Starting Word (reused for all conversions) ...")
-            word._ensure()
+            try:
+                word._ensure()
+            except Exception as e:
+                log_fn("❌ ERROR: Microsoft Word could not be started.")
+                log_fn("   Word is required to convert .doc, .docx, .msg files to PDF.")
+                log_fn("   Please ensure Microsoft Word is installed:")
+                log_fn("   → https://www.microsoft.com/office")
+                log_fn(f"   {e}")
+                msg_queue.put(("done", False, None))
+                return
 
         log_fn(f"Found {total} file(s) to process.\n")
 
@@ -502,16 +817,14 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
                 elif ext == '.msg':
                     html_path = os.path.join(temp_dir, f"conv_{idx}.html")
                     pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
-                    _msg_to_html(src, html_path)
-                    word.open_and_save_pdf(html_path, pdf_path, log_fn)
+                    # Try Outlook COM first; fall back to extract-msg if unavailable
                     try:
-                        os.remove(html_path)
+                        date_warn = _msg_to_html(src, html_path)
                     except Exception:
-                        pass
-                elif ext == '.eml':
-                    html_path = os.path.join(temp_dir, f"conv_{idx}.html")
-                    pdf_path = os.path.join(temp_dir, f"conv_{idx}.pdf")
-                    _eml_to_html(src, html_path)
+                        log_fn("    Outlook unavailable, using extract-msg fallback ...")
+                        date_warn = _msg_to_html_fallback(src, html_path)
+                    if date_warn:
+                        log_fn(f"    {date_warn}")
                     word.open_and_save_pdf(html_path, pdf_path, log_fn)
                     try:
                         os.remove(html_path)
@@ -534,7 +847,16 @@ def _run_bundle(input_dir, output_dir, rules, msg_queue, cancel_event):
 
                 processed += 1
             except Exception as e:
-                log_fn(f"    FAILED: {e}")
+                err_msg = str(e)
+                # Provide user-friendly hints for common errors
+                if "Couldn't find your file" in err_msg or "couldn't find" in err_msg.lower():
+                    log_fn(f"    FAILED: File path issue (Word COM path encoding)")
+                    log_fn(f"    Hint: Try moving file to a path without special characters")
+                elif "Word" in err_msg or "ActiveX" in err_msg:
+                    log_fn(f"    FAILED: Microsoft Word error")
+                    log_fn(f"    Hint: Ensure Microsoft Word is properly installed")
+                else:
+                    log_fn(f"    FAILED: {e}")
                 log_fn(traceback.format_exc())
 
         word.quit()
@@ -687,6 +1009,7 @@ class BundleApp(ctk.CTk):
         self._build_ui()
         self._load_defaults()
         self._center_window()
+        _check_system_requirements()
         self._poll_queue()
 
     # ── build UI ──
@@ -711,9 +1034,26 @@ class BundleApp(ctk.CTk):
         ).pack(anchor="w")
         ctk.CTkLabel(
             frm,
-            text="Merge PDFs, Word docs, Outlook .msg / .eml emails into one PDF.",
+            text="Merge PDFs, Word docs, and Outlook .msg emails into one PDF.",
             font=ctk.CTkFont(size=13), text_color="gray",
         ).pack(anchor="w", pady=(2, 0))
+
+        # System status
+        word_status = "✓" if _check_word_available() else "⚠"
+        word_color = GREEN if _check_word_available() else ORANGE
+        status_frame = ctk.CTkFrame(frm, fg_color="transparent")
+        status_frame.pack(anchor="w", pady=(8, 0))
+        ctk.CTkLabel(
+            status_frame,
+            text=f"{word_status} Microsoft Word",
+            font=ctk.CTkFont(size=11), text_color=word_color,
+        ).pack(side="left", padx=(0, 4))
+        if not _check_word_available():
+            ctk.CTkLabel(
+                status_frame,
+                text="(Required for .doc, .docx, .msg files)",
+                font=ctk.CTkFont(size=10), text_color="gray",
+            ).pack(side="left")
 
     # ── folders ──
 
@@ -943,7 +1283,7 @@ class BundleApp(ctk.CTk):
             and os.path.splitext(f)[1].lower() in SUPPORTED_EXT)
         if count == 0:
             self._file_count_label.configure(
-                text="  No supported files found (pdf, doc, docx, msg, eml)",
+                text="  No supported files found (pdf, doc, docx, msg)",
                 text_color=ORANGE)
         else:
             self._file_count_label.configure(
@@ -1034,6 +1374,15 @@ class BundleApp(ctk.CTk):
         self._append_log("=" * 50)
         self._append_log("  Create Bundle - PDF Bundler")
         self._append_log("=" * 50)
+        self._append_log("")
+        
+        # Show system capabilities
+        if _check_word_available():
+            self._append_log("✓ Microsoft Word is available")
+        else:
+            self._append_log("⚠ Microsoft Word is NOT available")
+            self._append_log("  (PDFs only)")
+        self._append_log("")
 
         if rules:
             self._append_log("\nPage rules:")

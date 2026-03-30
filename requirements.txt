@@ -2,3 +2,6 @@ customtkinter
 pypdf
 comtypes
 pywin32
+darkdetect
+Pillow
+extract-msg

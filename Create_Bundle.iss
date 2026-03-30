@@ -41,6 +41,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
+; Visual C++ Runtime (required for PyInstaller bundles with Windows extensions)
+Source: "Microsoft Visual C++ 14 Runtime"; Check: not VCRedistInstalled; DestDir: "{tmp}"; Flags: deleteafterinstall ignoreversion
 ; Single exe from onefile build (all dependencies inside the exe)
 Source: "dist\Create_Bundle.exe"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -61,6 +63,12 @@ Type: dirifempty; Name: "{app}\INPUT"
 Type: dirifempty; Name: "{app}\OUTPUT"
 
 [Code]
+function VCRedistInstalled: Boolean;
+begin
+  Result := FileExists('C:\Windows\System32\vcruntime140.dll') or 
+            FileExists('C:\Windows\SysWOW64\vcruntime140.dll');
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
