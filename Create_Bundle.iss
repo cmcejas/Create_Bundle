@@ -42,7 +42,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; Visual C++ Runtime (required for PyInstaller bundles with Windows extensions)
-Source: "Microsoft Visual C++ 14 Runtime"; Check: not VCRedistInstalled; DestDir: "{tmp}"; Flags: deleteafterinstall ignoreversion
+Source: "Microsoft Visual C++ 14 Runtime"; Check: not VCRedistInstalled; DestDir: "{tmp}"; Flags: deleteafterinstall ignoreversion skipifsourcedoesntexist
 ; Single exe from onefile build (all dependencies inside the exe)
 Source: "dist\Create_Bundle.exe"; DestDir: "{app}"; Flags: ignoreversion
 
